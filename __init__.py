@@ -1,10 +1,10 @@
 bl_info = {
     "name": "OSC Bridge",
     "author": "Gemini & Freekx",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > OSC Bridge",
-    "description": "Real-time OSC live-linking and keyframe baking from TouchDesigner/OSC sources.",
+    "description": "Universal OSC receiver for Objects, Lights, Materials, World, and GeoNodes.",
     "category": "Animation",
 }
 
@@ -20,7 +20,6 @@ LISTENING = False
 SERVER_THREAD = None
 SOCK = None
 
-# --- OSC PARSING ---
 def parse_packet(data):
     try:
         if data.startswith(b'#bundle'):
@@ -44,7 +43,16 @@ def parse_packet(data):
 def get_osc(addr):
     return OSC_DATA.get(addr, {}).get("val", 0.0)
 
-# --- BAKE HANDLER ---
+def get_target_datapath(ch):
+    """Returns the actual data block based on user selection"""
+    tp = ch.target_type
+    if tp == 'OBJECT': return ch.ptr_obj
+    if tp == 'MATERIAL': return ch.ptr_mat
+    if tp == 'LIGHT': return ch.ptr_light
+    if tp == 'WORLD': return ch.ptr_world
+    if tp == 'SCENE': return bpy.context.scene
+    return None
+
 def osc_recording_handler(scene):
     props = scene.osc_tool
     if props.ui_mode != 'RECORD' or not props.is_recording or not bpy.context.screen.is_animation_playing:
@@ -52,17 +60,19 @@ def osc_recording_handler(scene):
     for ch in props.record_channels:
         if not ch.enabled or ch.osc_address not in OSC_DATA: continue
         val = OSC_DATA[ch.osc_address]["val"]
-        
-        # Simple noise thinning
         if abs(val - ch.last_val) < ch.thinning: continue
         
         try:
-            target = ch.target_obj if ch.target_type == 'OBJECT' else ch.target_mat
+            target = get_target_datapath(ch)
             if not target: continue
-            if ch.target_type == 'OBJECT':
-                target.path_resolve(ch.path)[ch.index] = val
-            else: 
-                target.node_tree.path_resolve(ch.path).default_value = val
+            
+            # Universal Resolve
+            resolved = target.path_resolve(ch.path)
+            if hasattr(resolved, "__len__"): # If it's an array (location, color)
+                resolved[ch.index] = val
+            else: # If it's a single float (energy, alpha)
+                exec(f"target.{ch.path} = {val}")
+                
             target.keyframe_insert(data_path=ch.path, index=ch.index)
             ch.last_val = val
         except: pass
@@ -101,17 +111,15 @@ class OSC_OT_CleanDrivers(bpy.types.Operator):
     bl_idname = "osc.clean_drivers"
     bl_label = "Kill OSC Drivers"
     def execute(self, context):
+        # This scans ALL data blocks for OSC drivers
         count = 0
-        for obj in bpy.data.objects:
-            if obj.animation_data:
-                for d in reversed(obj.animation_data.drivers):
-                    if "osc(" in d.driver.expression:
-                        obj.driver_remove(d.data_path, d.array_index); count += 1
-        for mat in bpy.data.materials:
-            if mat.node_tree and mat.node_tree.animation_data:
-                for d in reversed(mat.node_tree.animation_data.drivers):
-                    if "osc(" in d.driver.expression:
-                        mat.node_tree.driver_remove(d.data_path, d.array_index); count += 1
+        search_areas = [bpy.data.objects, bpy.data.materials, bpy.data.lights, bpy.data.worlds, [bpy.context.scene]]
+        for area in search_areas:
+            for item in area:
+                if item.animation_data:
+                    for d in reversed(item.animation_data.drivers):
+                        if "osc(" in d.driver.expression:
+                            item.driver_remove(d.data_path, d.array_index); count += 1
         self.report({'INFO'}, f"Cleaned {count} OSC drivers.")
         return {'FINISHED'}
 
@@ -134,20 +142,31 @@ class OSC_OT_ApplyDriver(bpy.types.Operator):
     idx: bpy.props.IntProperty()
     def execute(self, context):
         ch = context.scene.osc_tool.live_channels[self.idx]
-        if ch.target_obj:
+        target = get_target_datapath(ch)
+        if target:
             try:
-                d = ch.target_obj.driver_add(ch.path, ch.index).driver
+                d = target.driver_add(ch.path, ch.index).driver
                 d.expression = f'osc("{ch.osc_address}")'
-            except: self.report({'ERROR'}, "Invalid Path")
+            except: self.report({'ERROR'}, "Invalid Path for this Data Type")
         return {'FINISHED'}
 
 # --- UI & DATA ---
 class OSCChannel(bpy.types.PropertyGroup):
     enabled: bpy.props.BoolProperty(default=True)
     osc_address: bpy.props.StringProperty(name="Addr", default="/val")
-    target_type: bpy.props.EnumProperty(items=[('OBJECT', "Object", ""), ('MATERIAL', "Shader", "")])
-    target_obj: bpy.props.PointerProperty(type=bpy.types.Object)
-    target_mat: bpy.props.PointerProperty(type=bpy.types.Material)
+    target_type: bpy.props.EnumProperty(
+        name="Type",
+        items=[('OBJECT', "Object", "Transform/Modifiers"), 
+               ('LIGHT', "Light", "Intensity/Color"),
+               ('MATERIAL', "Material", "Shaders"), 
+               ('WORLD', "World", "Environment"),
+               ('SCENE', "Scene", "Custom Props")]
+    )
+    ptr_obj: bpy.props.PointerProperty(type=bpy.types.Object)
+    ptr_mat: bpy.props.PointerProperty(type=bpy.types.Material)
+    ptr_light: bpy.props.PointerProperty(type=bpy.types.Light)
+    ptr_world: bpy.props.PointerProperty(type=bpy.types.World)
+    
     path: bpy.props.StringProperty(name="Path", default="location")
     index: bpy.props.IntProperty(name="Idx", default=0)
     thinning: bpy.props.FloatProperty(name="Thinning", default=0.001, precision=4)
@@ -161,7 +180,7 @@ class OSCToolProps(bpy.types.PropertyGroup):
     ui_max: bpy.props.FloatProperty(name="Traffic Scale", default=5.0)
 
 class OSC_PT_Panel(bpy.types.Panel):
-    bl_label = "OSC Bridge Pro"
+    bl_label = "OSC Bridge Pro v1.1.0"
     bl_idname = "OSC_PT_main"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -176,45 +195,47 @@ class OSC_PT_Panel(bpy.types.Panel):
         layout.separator()
         layout.prop(tool, "ui_mode", expand=True)
 
+        mode_list = tool.live_channels if tool.ui_mode == 'LIVE' else tool.record_channels
+        
         if tool.ui_mode == 'LIVE':
-            box = layout.box()
-            box.operator("osc.clean_drivers", text="Kill OSC Drivers", icon='X')
-            for i, ch in enumerate(tool.live_channels):
-                cbox = box.box()
-                row = cbox.row()
-                row.prop(ch, "osc_address", text="")
-                row.prop(ch, "target_obj", text="")
-                op = row.operator("osc.channel_ctrl", text="", icon='PANEL_CLOSE', emboss=False)
-                op.target_mode, op.action, op.index = 'LIVE', 'REMOVE', i
-                col = cbox.column(align=True)
-                r1 = col.row(); r1.prop(ch, "path"); r1.prop(ch, "index")
-                col.operator("osc.apply_driver", text="Apply Driver Link").idx = i
-            op = layout.operator("osc.channel_ctrl", text="Add Patch", icon='ADD')
-            op.target_mode, op.action = 'LIVE', 'ADD'
-        else:
+            layout.operator("osc.clean_drivers", text="Kill OSC Drivers", icon='X')
+
+        for i, ch in enumerate(mode_list):
             box = layout.box()
             row = box.row()
-            row.prop(tool, "is_recording", text="RECORDING ON" if tool.is_recording else "ARM RECORDING", 
-                     toggle=True, icon='REC' if tool.is_recording else 'RADIOBUT_OFF')
-            for i, ch in enumerate(tool.record_channels):
-                cbox = box.box()
-                row = cbox.row(); row.prop(ch, "target_type", expand=True)
-                op = row.operator("osc.channel_ctrl", text="", icon='PANEL_CLOSE', emboss=False)
-                op.target_mode, op.action, op.index = 'RECORD', 'REMOVE', i
-                col = cbox.column(align=True)
-                col.prop(ch, "osc_address")
-                if ch.target_type == 'OBJECT': col.prop(ch, "target_obj")
-                else: col.prop(ch, "target_mat")
-                r2 = col.row(); r2.prop(ch, "path"); r2.prop(ch, "index")
+            row.prop(ch, "target_type", text="")
+            
+            # Dynamic Pointer based on type
+            if ch.target_type == 'OBJECT': row.prop(ch, "ptr_obj", text="")
+            elif ch.target_type == 'LIGHT': row.prop(ch, "ptr_light", text="")
+            elif ch.target_type == 'MATERIAL': row.prop(ch, "ptr_mat", text="")
+            elif ch.target_type == 'WORLD': row.prop(ch, "ptr_world", text="")
+            
+            op = row.operator("osc.channel_ctrl", text="", icon='PANEL_CLOSE', emboss=False)
+            op.target_mode, op.action, op.index = tool.ui_mode, 'REMOVE', i
+            
+            col = box.column(align=True)
+            col.prop(ch, "osc_address")
+            r1 = col.row(); r1.prop(ch, "path"); r1.prop(ch, "index")
+            
+            if tool.ui_mode == 'LIVE':
+                col.operator("osc.apply_driver", text="Apply Driver Link").idx = i
+            else:
                 col.prop(ch, "thinning")
-            op = layout.operator("osc.channel_ctrl", text="Add Bake Channel", icon='ADD')
-            op.target_mode, op.action = 'RECORD', 'ADD'
+
+        # Record Trigger
+        if tool.ui_mode == 'RECORD':
+            layout.prop(tool, "is_recording", text="RECORDING ON" if tool.is_recording else "ARM RECORDING", 
+                        toggle=True, icon='REC' if tool.is_recording else 'RADIOBUT_OFF')
+
+        # Add Button
+        op = layout.operator("osc.channel_ctrl", text="Add New Channel", icon='ADD')
+        op.target_mode, op.action = tool.ui_mode, 'ADD'
 
         if OSC_DATA:
             layout.separator()
             box = layout.box()
             box.label(text="Traffic Monitor", icon='NODE_SEL')
-            box.prop(tool, "ui_max")
             for addr in sorted(OSC_DATA.keys()):
                 val = OSC_DATA[addr]["val"]
                 sbox = box.box()
