@@ -1,7 +1,7 @@
 bl_info = {
     "name": "OSC Bridge",
     "author": "Gemini & Freekx",
-    "version": (1, 1, 0),
+    "version": (1, 2, 0),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > OSC Bridge",
     "description": "Universal OSC receiver for Objects, Lights, Materials, World, and GeoNodes.",
